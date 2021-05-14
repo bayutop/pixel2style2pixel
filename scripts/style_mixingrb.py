@@ -4,6 +4,7 @@ from argparse import Namespace
 from tqdm import tqdm
 import numpy as np
 from PIL import Image
+import PIL
 import torch
 from torch.utils.data import DataLoader
 import sys
