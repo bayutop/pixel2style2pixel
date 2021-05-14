@@ -99,7 +99,7 @@ def run():
 					i +=1
 					res = np.concatenate([res, np.array(output.resize(resize_amount))], axis=1)
 					res2 = output.resize(resize_amount)
-					res2.save(f'projection_animation/{i+1}.png')
+					res2.save(f'projection_animation/{i+1}.jpg')
 				Image.fromarray(res).save(os.path.join(mixed_path_results, os.path.basename(input_im_path)))
 				global_i += 1
 
