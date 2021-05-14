@@ -90,9 +90,15 @@ def run():
 				input_image = log_input_image(image, opts)
 				resize_amount = (256, 256) if opts.resize_outputs else (opts.output_size, opts.output_size)
 				res = np.array(input_image.resize(resize_amount))
+				
+				os.makedirs('projection_animation', exist_ok=True)
+				i=0
 				for output in multi_modal_outputs:
 					output = tensor2im(output)
+					i +=1
 					res = np.concatenate([res, np.array(output.resize(resize_amount))], axis=1)
+					res2 = output.resize(resize_amount)
+					res2.save(f'projection_animation/{i+1}.png')
 				Image.fromarray(res).save(os.path.join(mixed_path_results, os.path.basename(input_im_path)))
 				global_i += 1
 
