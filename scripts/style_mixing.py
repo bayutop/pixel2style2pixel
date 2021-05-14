@@ -1,101 +1,215 @@
+# Copyright (c) 2021, NVIDIA CORPORATION.  All rights reserved.
+#
+# NVIDIA CORPORATION and its licensors retain all intellectual property
+# and proprietary rights in and to this software, related documentation
+# and any modifications thereto.  Any use, reproduction, disclosure or
+# distribution of this software and related documentation without an express
+# license agreement from NVIDIA CORPORATION is strictly prohibited.
+
+"""Project given image to the latent space of pretrained network pickle."""
+
+import copy
 import os
-from argparse import Namespace
+from time import perf_counter
 
-from tqdm import tqdm
+import click
+import imageio
 import numpy as np
-from PIL import Image
+import PIL.Image
 import torch
-from torch.utils.data import DataLoader
-import sys
+import torch.nn.functional as F
 
-sys.path.append(".")
-sys.path.append("..")
+import dnnlib
+import legacy
 
-from configs import data_configs
-from datasets.inference_dataset import InferenceDataset
-from utils.common import tensor2im, log_input_image
-from options.test_options import TestOptions
-from models.psp import pSp
+def project(
+    G,
+    target: torch.Tensor, # [C,H,W] and dynamic range [0,255], W & H must match G output resolution
+    *,
+    num_steps                  = 1000,
+    w_avg_samples              = 10000,
+    initial_learning_rate      = 0.1,
+    initial_noise_factor       = 0.05,
+    lr_rampdown_length         = 0.25,
+    lr_rampup_length           = 0.05,
+    noise_ramp_length          = 0.75,
+    regularize_noise_weight    = 1e5,
+    verbose                    = False,
+    device: torch.device
+):
+    assert target.shape == (G.img_channels, G.img_resolution, G.img_resolution)
 
+    def logprint(*args):
+        if verbose:
+            print(*args)
 
-def run():
-	test_opts = TestOptions().parse()
+    G = copy.deepcopy(G).eval().requires_grad_(False).to(device) # type: ignore
 
-	if test_opts.resize_factors is not None:
-		factors = test_opts.resize_factors.split(',')
-		assert len(factors) == 1, "When running inference, please provide a single downsampling factor!"
-		mixed_path_results = os.path.join(test_opts.exp_dir, 'style_mixing',
-		                                  'downsampling_{}'.format(test_opts.resize_factors))
-	else:
-		mixed_path_results = os.path.join(test_opts.exp_dir, 'style_mixing')
-	os.makedirs(mixed_path_results, exist_ok=True)
+    # Compute w stats.
+    logprint(f'Computing W midpoint and stddev using {w_avg_samples} samples...')
+    z_samples = np.random.RandomState(123).randn(w_avg_samples, G.z_dim)
+    w_samples = G.mapping(torch.from_numpy(z_samples).to(device), None)  # [N, L, C]
+    w_samples = w_samples[:, :1, :].cpu().numpy().astype(np.float32)       # [N, 1, C]
+    w_avg = np.mean(w_samples, axis=0, keepdims=True)      # [1, 1, C]
+    w_std = (np.sum((w_samples - w_avg) ** 2) / w_avg_samples) ** 0.5
 
-	# update test options with options used during training
-	ckpt = torch.load(test_opts.checkpoint_path, map_location='cpu')
-	opts = ckpt['opts']
-	opts.update(vars(test_opts))
-	if 'learn_in_w' not in opts:
-		opts['learn_in_w'] = False
-	if 'output_size' not in opts:
-		opts['output_size'] = 1024
-	opts = Namespace(**opts)
+    # Setup noise inputs.
+    noise_bufs = { name: buf for (name, buf) in G.synthesis.named_buffers() if 'noise_const' in name }
 
-	net = pSp(opts)
-	net.eval()
-	net.cuda()
+    # Load VGG16 feature detector.
+    f='/content/drive/Shareddrives/virtual/PKL/vgg16.pt'
+    vgg16 = torch.jit.load(f).eval().to(device)
 
-	print('Loading dataset for {}'.format(opts.dataset_type))
-	dataset_args = data_configs.DATASETS[opts.dataset_type]
-	transforms_dict = dataset_args['transforms'](opts).get_transforms()
-	dataset = InferenceDataset(root=opts.data_path,
-	                           transform=transforms_dict['transform_inference'],
-	                           opts=opts)
-	dataloader = DataLoader(dataset,
-	                        batch_size=opts.test_batch_size,
-	                        shuffle=False,
-	                        num_workers=int(opts.test_workers),
-	                        drop_last=True)
+    # Features for target image.
+    target_images = target.unsqueeze(0).to(device).to(torch.float32)
+    if target_images.shape[2] > 256:
+        target_images = F.interpolate(target_images, size=(256, 256), mode='area')
+    target_features = vgg16(target_images, resize_images=False, return_lpips=True)
 
-	latent_mask = [int(l) for l in opts.latent_mask.split(",")]
-	if opts.n_images is None:
-		opts.n_images = len(dataset)
+    w_opt = torch.tensor(w_avg, dtype=torch.float32, device=device, requires_grad=True) # pylint: disable=not-callable
+    w_out = torch.zeros([num_steps] + list(w_opt.shape[1:]), dtype=torch.float32, device=device)
+    optimizer = torch.optim.Adam([w_opt] + list(noise_bufs.values()), betas=(0.9, 0.999), lr=initial_learning_rate)
 
-	global_i = 0
-	for input_batch in tqdm(dataloader):
-		if global_i >= opts.n_images:
-			break
-		with torch.no_grad():
-			input_batch = input_batch.cuda()
-			for image_idx, input_image in enumerate(input_batch):
-				# generate random vectors to inject into input image
-				vecs_to_inject = np.random.randn(opts.n_outputs_to_generate, 512).astype('float32')
-				multi_modal_outputs = []
-				for vec_to_inject in vecs_to_inject:
-					cur_vec = torch.from_numpy(vec_to_inject).unsqueeze(0).to("cuda")
-					# get latent vector to inject into our input image
-					_, latent_to_inject = net(cur_vec,
-					                          input_code=True,
-					                          return_latents=True)
-					# get output image with injected style vector
-					res = net(input_image.unsqueeze(0).to("cuda").float(),
-					          latent_mask=latent_mask,
-					          inject_latent=latent_to_inject,
-					          alpha=opts.mix_alpha,
-							  resize=opts.resize_outputs)
-					multi_modal_outputs.append(res[0])
+    # Init noise.
+    for buf in noise_bufs.values():
+        buf[:] = torch.randn_like(buf)
+        buf.requires_grad = True
 
-				# visualize multi modal outputs
-				input_im_path = dataset.paths[global_i]
-				image = input_batch[image_idx]
-				input_image = log_input_image(image, opts)
-				resize_amount = (256, 256) if opts.resize_outputs else (opts.output_size, opts.output_size)
-				res = np.array(input_image.resize(resize_amount))
-				for output in multi_modal_outputs:
-					output = tensor2im(output)
-					res = np.concatenate([res, np.array(output.resize(resize_amount))], axis=1)
-				Image.fromarray(res).save(os.path.join(mixed_path_results, os.path.basename(input_im_path)))
-				global_i += 1
+    for step in range(num_steps):
+        # Learning rate schedule.
+        t = step / num_steps
+        w_noise_scale = w_std * initial_noise_factor * max(0.0, 1.0 - t / noise_ramp_length) ** 2
+        lr_ramp = min(1.0, (1.0 - t) / lr_rampdown_length)
+        lr_ramp = 0.5 - 0.5 * np.cos(lr_ramp * np.pi)
+        lr_ramp = lr_ramp * min(1.0, t / lr_rampup_length)
+        lr = initial_learning_rate * lr_ramp
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
 
+        # Synth images from opt_w.
+        w_noise = torch.randn_like(w_opt) * w_noise_scale
+        ws = (w_opt + w_noise).repeat([1, G.mapping.num_ws, 1])
+        synth_images = G.synthesis(ws, noise_mode='const')
 
-if __name__ == '__main__':
-	run()
+        # Downsample image to 256x256 if it's larger than that. VGG was built for 224x224 images.
+        synth_images = (synth_images + 1) * (255/2)
+        if synth_images.shape[2] > 256:
+            synth_images = F.interpolate(synth_images, size=(256, 256), mode='area')
+
+        # Features for synth images.
+        synth_features = vgg16(synth_images, resize_images=False, return_lpips=True)
+        dist = (target_features - synth_features).square().sum()
+
+        # Noise regularization.
+        reg_loss = 0.0
+        for v in noise_bufs.values():
+            noise = v[None,None,:,:] # must be [1,1,H,W] for F.avg_pool2d()
+            while True:
+                reg_loss += (noise*torch.roll(noise, shifts=1, dims=3)).mean()**2
+                reg_loss += (noise*torch.roll(noise, shifts=1, dims=2)).mean()**2
+                if noise.shape[2] <= 8:
+                    break
+                noise = F.avg_pool2d(noise, kernel_size=2)
+        loss = dist + reg_loss * regularize_noise_weight
+
+        # Step
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+        logprint(f'step {step+1:>4d}/{num_steps}: dist {dist:<4.2f} loss {float(loss):<5.2f}')
+
+        # Save projected W for each optimization step.
+        w_out[step] = w_opt.detach()[0]
+
+        # Normalize noise.
+        with torch.no_grad():
+            for buf in noise_bufs.values():
+                buf -= buf.mean()
+                buf *= buf.square().mean().rsqrt()
+
+    return w_out.repeat([1, G.mapping.num_ws, 1])
+
+#----------------------------------------------------------------------------
+
+@click.command()
+@click.option('--network', 'network_pkl', help='Network pickle filename', required=True)
+@click.option('--target', 'target_fname', help='Target image file to project to', required=True, metavar='FILE')
+@click.option('--num-steps',              help='Number of optimization steps', type=int, default=1000, show_default=True)
+@click.option('--seed',                   help='Random seed', type=int, default=303, show_default=True)
+@click.option('--save-video',             help='Save an mp4 video of optimization progress', type=bool, default=True, show_default=True)
+@click.option('--outdir',                 help='Where to save the output images', required=True, metavar='DIR')
+def run_projection(
+    network_pkl: str,
+    target_fname: str,
+    outdir: str,
+    save_video: bool,
+    seed: int,
+    num_steps: int
+):
+    """Project given image to the latent space of pretrained network pickle.
+
+    Examples:
+
+    \b
+    python projector.py --outdir=out --target=~/mytargetimg.png \\
+        --network=https://nvlabs-fi-cdn.nvidia.com/stylegan2-ada-pytorch/pretrained/ffhq.pkl
+    """
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    # Load networks.
+    print('Loading networks from "%s"...' % network_pkl)
+    device = torch.device('cuda')
+    with dnnlib.util.open_url(network_pkl) as fp:
+        G = legacy.load_network_pkl(fp)['G_ema'].requires_grad_(False).to(device) # type: ignore
+
+    # Load target image.
+    target_pil = PIL.Image.open(target_fname).convert('RGB')
+    w, h = target_pil.size
+    s = min(w, h)
+    target_pil = target_pil.crop(((w - s) // 2, (h - s) // 2, (w + s) // 2, (h + s) // 2))
+    target_pil = target_pil.resize((G.img_resolution, G.img_resolution), PIL.Image.LANCZOS)
+    target_uint8 = np.array(target_pil, dtype=np.uint8)
+
+    # Optimize projection.
+    start_time = perf_counter()
+    projected_w_steps = project(
+        G,
+        target=torch.tensor(target_uint8.transpose([2, 0, 1]), device=device), # pylint: disable=not-callable
+        num_steps=num_steps,
+        device=device,
+        verbose=True
+    )
+    print (f'Elapsed: {(perf_counter()-start_time):.1f} s')
+
+    # Render debug output: optional video and projected image and W vector.
+    os.makedirs(outdir, exist_ok=True)
+    os.makedirs('projection_animation', exist_ok=True)
+    
+    if save_video:
+        video = imageio.get_writer(f'{outdir}/proj.mp4', mode='I', fps=10, codec='libx264', bitrate='16M')
+        print (f'Saving optimization progress video "{outdir}/proj.mp4"')
+        i=0
+        for projected_w in projected_w_steps:           
+            synth_image = G.synthesis(projected_w.unsqueeze(0), noise_mode='const')
+            synth_image = (synth_image + 1) * (255/2)
+            synth_image = synth_image.permute(0, 2, 3, 1).clamp(0, 255).to(torch.uint8)[0].cpu().numpy()
+            PIL.Image.fromarray(synth_image, 'RGB').save(f'projection_animation/{i+1}.png')
+            video.append_data(synth_image)
+        video.close()
+
+    # Save final projected frame and W vector.
+    target_pil.save(f'{outdir}/target.png')
+    projected_w = projected_w_steps[-1]
+    synth_image = G.synthesis(projected_w.unsqueeze(0), noise_mode='const')
+    synth_image = (synth_image + 1) * (255/2)
+    synth_image = synth_image.permute(0, 2, 3, 1).clamp(0, 255).to(torch.uint8)[0].cpu().numpy()
+    PIL.Image.fromarray(synth_image, 'RGB').save(f'{outdir}/proj.png')
+    np.savez(f'{outdir}/projected_w.npz', w=projected_w.unsqueeze(0).cpu().numpy())
+
+#----------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    run_projection() # pylint: disable=no-value-for-parameter
+
+#----------------------------------------------------------------------------
